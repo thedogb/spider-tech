@@ -7,10 +7,18 @@
 上面这个页面中的5000个电影的信息
 """
 
+import multiprocessing
+from multiprocessing import Manager, Pool, Queue
 import requests
 from lxml import etree
 import json
 import time
+
+
+# 定义一个全局任务队列
+queue = Manager().list()
+id_queue = Queue()
+
 
 def download(url, parser_fn=None, delay=0.1):
     """
@@ -81,50 +89,67 @@ def write(f, item):
     line = json.dumps(item, ensure_ascii=False)
     f.write(line+"\n")
 
+def process_one(pid, task):
+    task_id, url = task
+    if task_id == 0:
+        urls = download(url, parse_url)
+        for new_url in urls:
+            # 将新的url作为任务加入任务池
+            queue.append((1, new_url))
+
+    elif task_id == 1:
+        item = download(url, parser_fn=parse)
+        if item == None:
+            err_path = "./out/error_%d.csv"%pid
+            err_f = open(err_path, 'a')
+            err_f.write(url+'\n')
+            err_f.close()
+        else:
+            content = item
+            out_f = open("./out/result_%d.json"%pid, 'a')
+            write(out_f, content)
+            out_f.close()
+
+    # 完成后，将pid释放
+    id_queue.put(pid, block=False)
+
+
+
+
 def main():
-    rest_urls = set()
-    host = "https://v.qq.com"
-    error_urls = set([])
-    finished_urls = set([])
-
-    out_f = open("./out/result.json", 'w')
-    error_f = open("./out/error.csv", 'w')
-    finished_f = open("./out/finished.csv", 'w')
-
+    # 1. 将展示页链接放入任务池
     raw_url = "https://v.qq.com/x/bu/pagesheet/list?append=1&channel=movie&itype=100062&listpage=2&offset=%d&pagesize=%d"
     pagesize = 30
-
-    # 1. 获取五千部电影的链接
-    print("download urls...")
     for offset in range(0, 500, pagesize):
-        print("%d urls have been downloaded!" % offset)
         url = raw_url%(offset, pagesize)
-        urls = download(url, parse_url)
-        rest_urls |= urls
+        queue.append((0, url))
 
-    # 2. 开始下载每部电影信息
-    num = 0
-    for url in rest_urls:
-        print("%d urls have been downloaded, downloading %s..." % (num, url))
-        item = download(url, parser_fn=parse)
+    cpu_num = multiprocessing.cpu_count() * 2
+    # 2. 向id_queue存入编号
+    for i in range(cpu_num):
+        id_queue.put(i)
 
-        if item == None:
-            error_urls.add(url)
-        else:
-            finished_urls.add(url)
-            num += 1
+    # 3. 开始多进程下载
+    print("total cpu num: %d"%cpu_num)
+    pool = Pool(processes=cpu_num)
 
-            content = item
+    while True:
+        task = queue.pop(0)
+        pid = id_queue.get(block=True, timeout=600)
+        print("分配任务给进程：%d, %s"%(pid, task[1]))
+        pool.apply_async(process_one, (pid, task))
 
-            # 将数据写入文件
-            write(out_f, content)
+        if len(queue) == 0:
+            time.sleep(5)
+            if len(queue) == 0:
+                break
 
-    # 爬取完成，记录结果
-    for url in error_urls:
-        error_f.write(url+'\n')
+    print("waiting download finsh...")
+    pool.close()
+    pool.join()
 
-    for url in finished_urls:
-        finished_f.write(url+'\n')
+
+
 
 if __name__ == '__main__':
     import time
